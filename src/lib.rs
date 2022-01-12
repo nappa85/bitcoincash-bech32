@@ -22,7 +22,7 @@
 //!
 //! Bech32 is an encoding scheme that is easy to use for humans and efficient to encode in QR codes.
 //!
-//! A Bech32 string consists of a human-readable part (HRP), a separator (the character `'1'`), and
+//! A Bech32 string consists of a human-readable part (HRP), a separator (the character `':'`), and
 //! a data part. A checksum at the end of the string provides error detection to prevent mistakes
 //! when the string is written off or read out loud.
 //!
@@ -36,7 +36,7 @@
 ```
 use bech32::{self, FromBase32, ToBase32, Variant};
 let encoded = bech32::encode(\"bech32\", vec![0x00, 0x01, 0x02].to_base32(), Variant::Bech32).unwrap();
-assert_eq!(encoded, \"bech321qqqsyrhqy2a\".to_string());
+assert_eq!(encoded, \"bech32:qqqsy7wwsnnhh\".to_string());
 let (hrp, data, variant) = bech32::decode(&encoded).unwrap();
 assert_eq!(hrp, \"bech32\");
 assert_eq!(Vec::<u8>::from_base32(&data).unwrap(), vec![0x00, 0x01, 0x02]);
@@ -71,7 +71,7 @@ use alloc::borrow::Cow;
 #[cfg(any(feature = "std", test))]
 use std::borrow::Cow;
 
-use core::{fmt, mem};
+use core::fmt;
 
 /// Integer in the range `0..32`
 #[derive(PartialEq, Eq, Debug, Copy, Clone, Default, PartialOrd, Ord, Hash)]
@@ -132,8 +132,9 @@ pub trait WriteBase32 {
 /// in the end.
 pub struct Bech32Writer<'a> {
     formatter: &'a mut fmt::Write,
-    chk: u32,
+    chk: u64,
     variant: Variant,
+    finalized: bool,
 }
 
 impl<'a> Bech32Writer<'a> {
@@ -150,6 +151,7 @@ impl<'a> Bech32Writer<'a> {
             formatter: fmt,
             chk: 1,
             variant,
+            finalized: false,
         };
 
         writer.formatter.write_str(hrp)?;
@@ -157,22 +159,19 @@ impl<'a> Bech32Writer<'a> {
 
         // expand HRP
         for b in hrp.bytes() {
-            writer.polymod_step(u5(b >> 5));
-        }
-        writer.polymod_step(u5(0));
-        for b in hrp.bytes() {
             writer.polymod_step(u5(b & 0x1f));
         }
+        writer.polymod_step(u5(0));
 
         Ok(writer)
     }
 
     fn polymod_step(&mut self, v: u5) {
-        let b = (self.chk >> 25) as u8;
-        self.chk = (self.chk & 0x01ff_ffff) << 5 ^ (u32::from(*v.as_ref()));
+        let b = (self.chk >> 35) as u8;
+        self.chk = (self.chk & 0x07ffffffff) << 5 ^ (u64::from(*v.as_ref()));
 
-        for (i, item) in GEN.iter().enumerate() {
-            if (b >> i) & 1 == 1 {
+        for (i, item) in GEN.iter() {
+            if (b & i) > 0 {
                 self.chk ^= item;
             }
         }
@@ -181,21 +180,21 @@ impl<'a> Bech32Writer<'a> {
     /// Write out the checksum at the end. If this method isn't called this will happen on drop.
     pub fn finalize(mut self) -> fmt::Result {
         self.inner_finalize()?;
-        mem::forget(self);
+        self.finalized = true;
         Ok(())
     }
 
     fn inner_finalize(&mut self) -> fmt::Result {
-        // Pad with 6 zeros
-        for _ in 0..6 {
+        // Pad with 8 zeros
+        for _ in 0..8 {
             self.polymod_step(u5(0))
         }
 
-        let plm: u32 = self.chk ^ self.variant.constant();
+        let plm: u64 = self.chk ^ self.variant.constant();
 
-        for p in 0..6 {
+        for p in 0..8 {
             self.formatter
-                .write_char(u5(((plm >> (5 * (5 - p))) & 0x1f) as u8).to_char())?;
+                .write_char(u5(((plm >> (5 * (7 - p))) & 0x1f) as u8).to_char())?;
         }
 
         Ok(())
@@ -213,8 +212,12 @@ impl<'a> WriteBase32 for Bech32Writer<'a> {
 
 impl<'a> Drop for Bech32Writer<'a> {
     fn drop(&mut self) {
-        self.inner_finalize()
-            .expect("Unhandled error writing the checksum on drop.")
+        if !self.finalized {
+            if let Err(e) = self.inner_finalize() {
+                // the drop can be caused by a panic, panicing on drop can cause a double panic, not good
+                eprintln!("Unhandled error writing the checksum on drop: {}", e);
+            }
+        }
     }
 }
 
@@ -431,12 +434,12 @@ pub enum Variant {
     Bech32m,
 }
 
-const BECH32_CONST: u32 = 1;
-const BECH32M_CONST: u32 = 0x2bc830a3;
+const BECH32_CONST: u64 = 1;
+const BECH32M_CONST: u64 = 0x2bc830a3;
 
 impl Variant {
     // Produce the variant based on the remainder of the polymod operation
-    fn from_remainder(c: u32) -> Option<Self> {
+    fn from_remainder(c: u64) -> Option<Self> {
         match c {
             BECH32_CONST => Some(Variant::Bech32),
             BECH32M_CONST => Some(Variant::Bech32m),
@@ -444,7 +447,7 @@ impl Variant {
         }
     }
 
-    fn constant(self) -> u32 {
+    fn constant(self) -> u64 {
         match self {
             Variant::Bech32 => BECH32_CONST,
             Variant::Bech32m => BECH32M_CONST,
@@ -533,7 +536,7 @@ pub fn decode(s: &str) -> Result<(String, Vec<u5>, Variant), Error> {
         Some(variant) => {
             // Remove checksum from data payload
             let dbl: usize = data.len();
-            data.truncate(dbl - 6);
+            data.truncate(dbl - 8);
 
             Ok((hrp_lower, data, variant))
         }
@@ -550,24 +553,21 @@ fn verify_checksum(hrp: &[u8], data: &[u5]) -> Option<Variant> {
 fn hrp_expand(hrp: &[u8]) -> Vec<u5> {
     let mut v: Vec<u5> = Vec::new();
     for b in hrp {
-        v.push(u5::try_from_u8(*b >> 5).expect("can't be out of range, max. 7"));
+        v.push(u5::try_from_u8(*b & 0x1f).expect("can't be out of range, max. 7"));
     }
     v.push(u5::try_from_u8(0).unwrap());
-    for b in hrp {
-        v.push(u5::try_from_u8(*b & 0x1f).expect("can't be out of range, max. 31"));
-    }
     v
 }
 
-fn polymod(values: &[u5]) -> u32 {
-    let mut chk: u32 = 1;
+fn polymod(values: &[u5]) -> u64 {
+    let mut chk: u64 = 1;
     let mut b: u8;
     for v in values {
-        b = (chk >> 25) as u8;
-        chk = (chk & 0x01ff_ffff) << 5 ^ (u32::from(*v.as_ref()));
+        b = (chk >> 35) as u8;
+        chk = (chk & 0x07ffffffff) << 5 ^ (u64::from(*v.as_ref()));
 
-        for (i, item) in GEN.iter().enumerate() {
-            if (b >> i) & 1 == 1 {
+        for (i, item) in GEN.iter() {
+            if (b & i) > 0 {
                 chk ^= item;
             }
         }
@@ -576,7 +576,7 @@ fn polymod(values: &[u5]) -> u32 {
 }
 
 /// Human-readable part and data part separator
-const SEP: char = '1';
+const SEP: char = ':';
 
 /// Encoding character set. Maps data value -> char
 const CHARSET: [char; 32] = [
@@ -597,12 +597,12 @@ const CHARSET_REV: [i8; 128] = [
 ];
 
 /// Generator coefficients
-const GEN: [u32; 5] = [
-    0x3b6a_57b2,
-    0x2650_8e6d,
-    0x1ea1_19fa,
-    0x3d42_33dd,
-    0x2a14_62b3,
+const GEN: [(u8, u64); 5] = [
+    (0x01, 0x98f2bc8e61),
+    (0x02, 0x79b76d99e2),
+    (0x04, 0xf33e5fb3c4),
+    (0x08, 0xae2eabe2a8),
+    (0x10, 0x1e4f43e470),
 ];
 
 /// Error types for Bech32 encoding / decoding
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn getters() {
-        let decoded = decode("BC1SW50QA3JX3S").unwrap();
+        let decoded = decode("BC:SW50QJK62X6AE").unwrap();
         let data = [16, 14, 20, 15, 0].check_base32().unwrap();
         assert_eq!(&decoded.0, "bc");
         assert_eq!(decoded.1, data.as_slice());
@@ -718,22 +718,40 @@ mod tests {
 
     #[test]
     fn valid_checksum() {
-        let strings: Vec<&str> = vec!(
-            // Bech32
-            "A12UEL5L",
-            "an83characterlonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1tt5tgs",
-            "abcdef1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw",
-            "11qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqc8247j",
-            "split1checkupstagehandshakeupstreamerranterredcaperred2y9e3w",
-            // Bech32m
-            "A1LQFN3A",
-            "a1lqfn3a",
-            "an83characterlonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11sg7hg6",
-            "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx",
-            "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8",
-            "split1checkupstagehandshakeupstreamerranterredcaperredlc445v",
-            "?1v759aa",
-        );
+        let strings = [
+            "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",
+            "bchtest:pr6m7j9njldwwzlg9v7v53unlr4jkmx6eyvwc0uz5t",
+            "pref:pr6m7j9njldwwzlg9v7v53unlr4jkmx6ey65nvtks5",
+            "prefix:0r6m7j9njldwwzlg9v7v53unlr4jkmx6ey3qnjwsrf",
+            "bitcoincash:q9adhakpwzztepkpwp5z0dq62m6u5v5xtyj7j3h2ws4mr9g0",
+            "bchtest:p9adhakpwzztepkpwp5z0dq62m6u5v5xtyj7j3h2u94tsynr",
+            "pref:p9adhakpwzztepkpwp5z0dq62m6u5v5xtyj7j3h2khlwwk5v",
+            "prefix:09adhakpwzztepkpwp5z0dq62m6u5v5xtyj7j3h2p29kc2lp",
+            "bitcoincash:qgagf7w02x4wnz3mkwnchut2vxphjzccwxgjvvjmlsxqwkcw59jxxuz",
+            "bchtest:pgagf7w02x4wnz3mkwnchut2vxphjzccwxgjvvjmlsxqwkcvs7md7wt",
+            "pref:pgagf7w02x4wnz3mkwnchut2vxphjzccwxgjvvjmlsxqwkcrsr6gzkn",
+            "prefix:0gagf7w02x4wnz3mkwnchut2vxphjzccwxgjvvjmlsxqwkc5djw8s9g",
+            "bitcoincash:qvch8mmxy0rtfrlarg7ucrxxfzds5pamg73h7370aa87d80gyhqxq5nlegake",
+            "bchtest:pvch8mmxy0rtfrlarg7ucrxxfzds5pamg73h7370aa87d80gyhqxq7fqng6m6",
+            "pref:pvch8mmxy0rtfrlarg7ucrxxfzds5pamg73h7370aa87d80gyhqxq4k9m7qf9",
+            "prefix:0vch8mmxy0rtfrlarg7ucrxxfzds5pamg73h7370aa87d80gyhqxqsh6jgp6w",
+            "bitcoincash:qnq8zwpj8cq05n7pytfmskuk9r4gzzel8qtsvwz79zdskftrzxtar994cgutavfklv39gr3uvz",
+            "bchtest:pnq8zwpj8cq05n7pytfmskuk9r4gzzel8qtsvwz79zdskftrzxtar994cgutavfklvmgm6ynej",
+            "pref:pnq8zwpj8cq05n7pytfmskuk9r4gzzel8qtsvwz79zdskftrzxtar994cgutavfklv0vx5z0w3",
+            "prefix:0nq8zwpj8cq05n7pytfmskuk9r4gzzel8qtsvwz79zdskftrzxtar994cgutavfklvwsvctzqy",
+            "bitcoincash:qh3krj5607v3qlqh5c3wq3lrw3wnuxw0sp8dv0zugrrt5a3kj6ucysfz8kxwv2k53krr7n933jfsunqex2w82sl",
+            "bchtest:ph3krj5607v3qlqh5c3wq3lrw3wnuxw0sp8dv0zugrrt5a3kj6ucysfz8kxwv2k53krr7n933jfsunqnzf7mt6x",
+            "pref:ph3krj5607v3qlqh5c3wq3lrw3wnuxw0sp8dv0zugrrt5a3kj6ucysfz8kxwv2k53krr7n933jfsunqjntdfcwg",
+            "prefix:0h3krj5607v3qlqh5c3wq3lrw3wnuxw0sp8dv0zugrrt5a3kj6ucysfz8kxwv2k53krr7n933jfsunqakcssnmn",
+            "bitcoincash:qmvl5lzvdm6km38lgga64ek5jhdl7e3aqd9895wu04fvhlnare5937w4ywkq57juxsrhvw8ym5d8qx7sz7zz0zvcypqscw8jd03f",
+            "bchtest:pmvl5lzvdm6km38lgga64ek5jhdl7e3aqd9895wu04fvhlnare5937w4ywkq57juxsrhvw8ym5d8qx7sz7zz0zvcypqs6kgdsg2g",
+            "pref:pmvl5lzvdm6km38lgga64ek5jhdl7e3aqd9895wu04fvhlnare5937w4ywkq57juxsrhvw8ym5d8qx7sz7zz0zvcypqsammyqffl",
+            "prefix:0mvl5lzvdm6km38lgga64ek5jhdl7e3aqd9895wu04fvhlnare5937w4ywkq57juxsrhvw8ym5d8qx7sz7zz0zvcypqsgjrqpnw8",
+            "bitcoincash:qlg0x333p4238k0qrc5ej7rzfw5g8e4a4r6vvzyrcy8j3s5k0en7calvclhw46hudk5flttj6ydvjc0pv3nchp52amk97tqa5zygg96mtky5sv5w",
+            "bchtest:plg0x333p4238k0qrc5ej7rzfw5g8e4a4r6vvzyrcy8j3s5k0en7calvclhw46hudk5flttj6ydvjc0pv3nchp52amk97tqa5zygg96mc773cwez",
+            "pref:plg0x333p4238k0qrc5ej7rzfw5g8e4a4r6vvzyrcy8j3s5k0en7calvclhw46hudk5flttj6ydvjc0pv3nchp52amk97tqa5zygg96mg7pj3lh8",
+            "prefix:0lg0x333p4238k0qrc5ej7rzfw5g8e4a4r6vvzyrcy8j3s5k0en7calvclhw46hudk5flttj6ydvjc0pv3nchp52amk97tqa5zygg96ms92w6845",
+        ];
         for s in strings {
             match decode(s) {
                 Ok((hrp, payload, variant)) => {
@@ -747,52 +765,52 @@ mod tests {
 
     #[test]
     fn invalid_strings() {
-        let pairs: Vec<(&str, Error)> = vec!(
-            (" 1nwldj5",
+        let pairs = [
+            (" :nwldj5",
                 Error::InvalidChar(' ')),
-            ("abc1\u{2192}axkwrx",
+            ("abc:\u{2192}axkwrx",
                 Error::InvalidChar('\u{2192}')),
-            ("an84characterslonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1569pvx",
+            ("an84characterslonghumanreadablepartthatcontainsthenumber:andtheexcludedcharactersbio:569pvx",
                 Error::InvalidLength),
             ("pzry9x0s0muk",
                 Error::MissingSeparator),
-            ("1pzry9x0s0muk",
+            (":pzry9x0s0muk",
                 Error::InvalidLength),
-            ("x1b4n0q5v",
+            ("x:b4n0q5v",
                 Error::InvalidChar('b')),
-            ("ABC1DEFGOH",
+            ("ABC:DEFGOH",
                 Error::InvalidChar('O')),
-            ("li1dgmt3",
+            ("li:dgmt3",
                 Error::InvalidLength),
-            ("de1lg7wt\u{ff}",
+            ("de:lg7wt\u{ff}",
                 Error::InvalidChar('\u{ff}')),
-            ("\u{20}1xj0phk",
+            ("\u{20}:xj0phk",
                 Error::InvalidChar('\u{20}')),
-            ("\u{7F}1g6xzxy",
+            ("\u{7F}:g6xzxy",
                 Error::InvalidChar('\u{7F}')),
-            ("an84characterslonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11d6pts4",
+            ("an84characterslonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber::d6pts4",
                 Error::InvalidLength),
             ("qyrz8wqd2c9m",
                 Error::MissingSeparator),
-            ("1qyrz8wqd2c9m",
+            (":qyrz8wqd2c9m",
                 Error::InvalidLength),
-            ("y1b0jsk6g",
+            ("y:b0jsk6g",
                 Error::InvalidChar('b')),
-            ("lt1igcx5c0",
+            ("lt:igcx5c0",
                 Error::InvalidChar('i')),
-            ("in1muywd",
+            ("in:muywd",
                 Error::InvalidLength),
-            ("mm1crxm3i",
+            ("mm:crxm3i",
                 Error::InvalidChar('i')),
-            ("au1s5cgom",
+            ("au:s5cgom",
                 Error::InvalidChar('o')),
-            ("M1VUXWEZ",
+            ("M:VUXWEZ",
                 Error::InvalidChecksum),
-            ("16plkw9",
+            (":6plkw9",
                 Error::InvalidLength),
-            ("1p2gdwpf",
+            (":p2gdwpf",
                 Error::InvalidLength),
-        );
+        ];
         for p in pairs {
             let (s, expected_error) = p;
             match decode(s) {
@@ -957,6 +975,14 @@ mod tests {
         // Tests for issue with HRP case checking being ignored for encoding
         let encoded_str = encode("HRP", [0x00, 0x00].to_base32(), Variant::Bech32).unwrap();
 
-        assert_eq!(encoded_str, "hrp1qqqq40atq3");
+        assert_eq!(encoded_str, "hrp:qqqq9rcnqmy0");
+    }
+
+    #[test]
+    fn round_test() {
+        let s = "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2";
+        let (hrp, data, variant) = decode(s).unwrap();
+        let encoded_str = encode(&hrp, data, variant).unwrap();
+        assert_eq!(encoded_str, s);
     }
 }

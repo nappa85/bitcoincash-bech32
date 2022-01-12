@@ -1,11 +1,11 @@
 [package]
-name = "bech32"
-version = "0.8.1"
-authors = ["Clark Moody"]
-repository = "https://github.com/rust-bitcoin/rust-bech32"
-description = "Encodes and decodes the Bech32 format"
+name = "bitcoincash-bech32"
+version = "0.1.0"
+authors = ["Marco Napetti"]
+repository = "https://github.com/nappa85/bitcoincash-bech32"
+description = "Encodes and decodes the BitcoinCash's Bech32 format"
 readme = "README.md"
-keywords = ["base32", "encoding", "bech32"]
+keywords = ["base32", "encoding", "bech32", "bitcoincash"]
 categories = ["encoding"]
 license = "MIT"
 
